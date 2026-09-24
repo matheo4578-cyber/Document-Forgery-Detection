@@ -1,0 +1,160 @@
+"""
+Document Guard — FastAPI Backend
+Performs ELA, Edge Detection, Texture/Noise analysis on uploaded images
+and returns authenticity scores + base64-encoded processed images for the UI.
+"""
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import uvicorn
+import pypdfium2 as pdfium
+
+from detector import DocumentAuthenticityDetector
+
+app = FastAPI(title="Document Guard API", version="2.0.0")
+
+# Allow the Vite dev server (port 5173 / 8080) to call the API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:8080",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:8080",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+detector = DocumentAuthenticityDetector()
+
+ACCEPTED_TYPES = {"image/jpeg", "image/png", "image/jpg", "application/pdf"}
+MAX_FILE_SIZE  = 10 * 1024 * 1024  # 10 MB
+
+
+@app.get("/health")
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/verify-document")
+@app.post("/api/verify-document")
+async def verify_document(file: UploadFile = File(...)):
+    """
+    Accepts a JPG or PNG image and returns:
+    - authenticity_score  (0–100, higher = more genuine)
+    - verdict             (string label)
+    - confidence          (0–100, maps to authenticity_score for UI)
+    - suspiciousRegions   (int count of flagged areas)
+    - details             (list of per-technique findings)
+    - processedImages     (dict with base64 ELA / edges / texture images)
+    - analysisTime        (seconds, float)
+    """
+    if file.content_type not in ACCEPTED_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file type. Please upload a PDF, JPG, or PNG document.",
+        )
+
+    contents = await file.read() # Read contents once
+
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail="File too large. Maximum size is 10 MB.",
+        )
+
+    pdf_text = ""
+    pdf_metadata = {}
+    is_pdf_flag = (file.content_type == "application/pdf")
+
+    if is_pdf_flag:
+        try:
+            pdf_doc = pdfium.PdfDocument(contents)
+            if len(pdf_doc) == 0:
+                raise ValueError("PDF document is empty.")
+            
+            first_page = pdf_doc[0]
+            # pypdfium2 text extraction
+            text_page = first_page.get_textpage()
+            pdf_text = text_page.get_text_range().lower() if text_page else ""
+            
+            # Since pypdfium2 doesn't extract all metadata dict easily, we'll extract standard ones if needed,
+            # or just leave it empty since Vercel size limit is more important.
+            pdf_metadata = {}
+
+            # Render page to numpy array
+            bitmap = first_page.render(
+                scale=150 / 72,  # 150 DPI
+            )
+            np_img = bitmap.to_numpy()
+            
+            import cv2
+            if len(np_img.shape) == 3 and np_img.shape[2] == 4:
+                bgr_img = cv2.cvtColor(np_img, cv2.COLOR_RGBA2BGR)
+            elif len(np_img.shape) == 3 and np_img.shape[2] == 3:
+                bgr_img = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+            else:
+                bgr_img = np_img
+
+            _, encoded_img = cv2.imencode('.png', bgr_img)
+            image_bytes = encoded_img.tobytes()
+            pdf_doc.close()
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to parse PDF document: {e}",
+            )
+    else:
+        image_bytes = contents
+
+    try:
+        is_pdf_flag = (file.content_type == "application/pdf")
+        result = detector.analyze(image_bytes, file.filename or "document", is_pdf=is_pdf_flag)
+        if is_pdf_flag:
+            import base64
+            b64 = base64.b64encode(image_bytes).decode("utf-8")
+            result["originalImage"] = f"data:image/png;base64,{b64}"
+
+            # --- PDF Digital Forgery Checks ---
+            suspicious_text = ["template", "sample", "demo", "fake", "specimen"]
+            found_text = [t for t in suspicious_text if t in pdf_text]
+            if found_text:
+                result["authenticity_score"] = max(0, result["authenticity_score"] - 60)
+                result["verdict"] = "LIKELY FAKE"
+                kw_str = ", ".join(found_text).upper()
+                result["flags"].append(f"PDF text layer contains fake/watermark keywords: {kw_str}")
+                result["details"].append({
+                    "technique": "PDF Text Analysis",
+                    "finding": f"Found watermark traces ({kw_str}) hidden in document text.",
+                    "severity": "high",
+                    "score": 10.0
+                })
+
+            suspicious_meta = ["fpdf", "tcpdf", "reportlab", "pdfreactor", "html2pdf"]
+            producer = pdf_metadata.get("producer", "").lower()
+            creator = pdf_metadata.get("creator", "").lower()
+            found_meta = [m for m in suspicious_meta if m in producer or m in creator]
+            if found_meta:
+                result["authenticity_score"] = max(0, result["authenticity_score"] - 40)
+                if result["authenticity_score"] < 45:
+                    result["verdict"] = "LIKELY FAKE"
+                mb_str = ", ".join(found_meta)
+                result["flags"].append(f"PDF generated by generic script engine: {mb_str}")
+                result["details"].append({
+                    "technique": "PDF Metadata Analysis",
+                    "finding": f"Document was scripted using {mb_str} instead of standard software.",
+                    "severity": "high",
+                    "score": 20.0
+                })
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(exc)}")
+
+    return JSONResponse(content=result)
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
